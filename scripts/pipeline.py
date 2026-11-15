@@ -109,7 +109,10 @@ def step_collect(aid: str, workdir: str, fresh: bool) -> str | None:
     if os.path.exists(out) and not fresh:
         log("S1", f"跳过（已存在 {os.path.basename(out)}）")
         return out
-    log("S1", "启动隔离浏览器实例抓取（不影响你正在用的浏览器）…")
+    if str(config.get("headless", default=False)).strip().lower() in ("1", "true", "yes", "on"):
+        log("S1", "后台抓取（headless，不弹窗口）…")
+    else:
+        log("S1", "启动隔离浏览器实例抓取（不影响你正在用的浏览器）…")
     r = subprocess.run([PY, os.path.join(HERE, "fetch_douyin.py"), aid, "--outdir", workdir],
                        capture_output=True)
     txt = (r.stdout + r.stderr).decode("utf-8", "replace")

@@ -239,12 +239,21 @@ export BILI_SESSDATA="..."                    # 可选，B 站高清
 
 ```json
 {
-  "browser_exe": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  "browser_exe": "C:/Program Files/Citro Labs/ego lite/Application/ego.exe",
+  "headless": true,
   "model_dir": "D:/models/faster-whisper-large-v3",
   "vault": "D:/Notes/Obsidian",
   "port": 9223
 }
 ```
+
+- `headless: true` — 后台模式：隔离实例不弹窗口（`--headless=new`），不影响正常使用。
+  实测 ego 156 headless 下抖音抓取正常（UA 带 `HeadlessChrome` 特征，个别视频可能触发风控）。
+  B 站登录（`bili_login.py`）扫码**必须**有窗口，会忽略此配置。
+- 浏览器换过实测：ego（Chromium 156）✓、Chrome ✓。ego 对 `Browser.close` 反应慢，
+  容易留僵尸实例（端口能应答 `/json/version` 但 `/json/list` 没有页面）——
+  `fetch_douyin.py` 已内置防护：复用前验证端口可用性，僵尸则按端口号定位 PID 强杀
+  （只杀占调试端口的进程，绝不 `taskkill /IM`，避免误杀用户自己开着的浏览器）。
 
 先跑诊断确认环境：
 
@@ -423,6 +432,8 @@ python scripts/clip_watch.py            # 常驻监听，写 queue.jsonl
 常见症状与根因见 `references/troubleshooting.md`。最高频的几个：
 
 - **抓到 0 条 `aweme_detail`**：实例复用了上一次的旧标签页 → 删 `--profile` 目录重跑
+- **`找不到可用标签页`**：端口上是上次遗留的僵尸实例 → 已自动按 PID 清理重启；
+  若仍出现，手动 `netstat -ano | findstr :9223` 找 PID 后 `taskkill /PID <pid> /F /T`
 - **`cublas64_12.dll is not found`**：装了 `nvidia-*` 包但没加 DLL 目录 → 脚本已自动处理；若仍报错，改用 `--device cpu`
 - **端口起不来 / 瞬间消失**：启动、抓取、关闭**必须在同一进程内**完成；不要把「起浏览器」和「抓取」拆成两条命令
 

@@ -124,19 +124,71 @@ def _version(port: int) -> dict | None:
         return None
 
 
-def ensure_browser(exe: str, port: int, profile: str, first_url: str, wait: int = 30) -> bool:
+def _port_pages(port: int) -> list[dict]:
+    """端口上真正可用的 page 标签页列表。僵尸实例会应答 version 但没有 page。"""
+    try:
+        return [t for t in _http_json(port, "/json/list") if t.get("type") == "page"]
+    except Exception:
+        return []
+
+
+def _port_pids(port: int) -> list[int]:
+    """用 netstat 找出占用该调试端口的进程 PID。只按端口号定位，
+    绝不 taskkill /IM，避免误杀用户自己开着的浏览器窗口。"""
+    try:
+        r = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return []
+    pids: set[int] = set()
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        # 形如: TCP  127.0.0.1:9223  0.0.0.0:0  LISTENING  12345
+        if len(parts) >= 5 and parts[0] == "TCP" \
+                and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+            try:
+                pids.add(int(parts[4]))
+            except ValueError:
+                pass
+    return sorted(pids)
+
+
+def _kill_pids(pids: list[int]) -> None:
+    for pid in pids:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                       capture_output=True, timeout=20)
+    if pids:
+        time.sleep(2)
+
+
+def _truthy(v) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def ensure_browser(exe: str, port: int, profile: str, first_url: str,
+                   wait: int = 30, headless: bool = False) -> bool:
     if _version(port):
-        log(f"复用已存在的实例 :{port}")
-        return True
+        if _port_pages(port):
+            log(f"复用已存在的实例 :{port}")
+            return True
+        # 僵尸实例：端口有响应但没有可用页面（ego 对 Browser.close 反应慢的遗留物）
+        zombies = _port_pids(port)
+        log(f":{port} 上是僵尸实例（无可用页面），按 PID 清理: {zombies}")
+        _kill_pids(zombies)
     os.makedirs(profile, exist_ok=True)   # Chromium 136+ 不给 --user-data-dir 会禁用调试端口
     args = [exe,
             f"--remote-debugging-port={port}",
             "--remote-allow-origins=*",
             f"--user-data-dir={profile}",
             "--no-first-run", "--no-default-browser-check",
-            "--disable-popup-blocking", "--mute-audio",
-            first_url]
-    log("启动独立实例（不影响你正在用的浏览器）")
+            "--disable-popup-blocking", "--mute-audio"]
+    if headless:
+        # 后台模式：不弹窗口。注意 UA 会带 HeadlessChrome 特征，
+        # 抖音实测仍能抓到 aweme_detail（2026-11-15），但个别视频可能触发风控
+        args.append("--headless=new")
+    args.append(first_url)
+    log("启动独立实例（后台模式，不弹窗口）" if headless
+        else "启动独立实例（不影响你正在用的浏览器）")
     subprocess.Popen(args, creationflags=0x00000008 | 0x00000200, close_fds=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for i in range(wait):
@@ -149,7 +201,8 @@ def ensure_browser(exe: str, port: int, profile: str, first_url: str, wait: int 
 
 
 def shutdown(port: int) -> None:
-    """用 CDP 的 Browser.close 优雅关闭，比 taskkill 精确。"""
+    """CDP Browser.close 优雅关闭；ego 反应慢时按 PID 补刀。
+    只杀占用本调试端口的进程，不影响用户自己开着的浏览器。"""
     try:
         v = _version(port)
         if not v:
@@ -158,9 +211,20 @@ def shutdown(port: int) -> None:
         w = websocket.create_connection(v["webSocketDebuggerUrl"], timeout=5)
         w.send(json.dumps({"id": 1, "method": "Browser.close"}))
         w.close()
-        log("已关闭实例")
     except Exception as e:
-        log(f"关闭实例失败（可忽略）：{type(e).__name__}")
+        log(f"Browser.close 失败（稍后按 PID 清理）：{type(e).__name__}")
+    # 轮询确认真的退了；ego 关得慢，最多等 10s
+    for _ in range(10):
+        time.sleep(1)
+        if not _version(port):
+            log("已关闭实例")
+            return
+    leftovers = _port_pids(port)
+    if leftovers:
+        log(f"实例未退出，按 PID 补刀: {leftovers}")
+        _kill_pids(leftovers)
+    else:
+        log("端口仍未就绪清理（无监听进程），忽略")
 
 
 # ---------------------------------------------------------------- 抓取
@@ -269,7 +333,8 @@ def main() -> int:
     os.makedirs(args.outdir, exist_ok=True)
 
     try:
-        if not ensure_browser(exe, port, profile, page):
+        if not ensure_browser(exe, port, profile, page,
+                              headless=_truthy(config.get("headless", default=False))):
             return 3
         time.sleep(2)
         items = collect_detail(port, aid, page, args.wait, args.timeout)

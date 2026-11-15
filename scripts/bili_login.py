@@ -131,7 +131,10 @@ def main() -> int:
     print(f"  profile: {profile}")
     print(f"  端口: {port}\n")
 
-    if not ensure_browser(chrome, port, profile, LOGIN_URL if need_scan else "https://www.bilibili.com", wait=45):
+    # 扫码必须在可见窗口里进行，这里无视 headless 配置，强制有头
+    if not ensure_browser(chrome, port, profile,
+                          LOGIN_URL if need_scan else "https://www.bilibili.com",
+                          wait=45, headless=False):
         print("✗ 浏览器起不来。多半是 profile 正被占用（先关掉所有浏览器窗口再试），或端口冲突。")
         return 1
 

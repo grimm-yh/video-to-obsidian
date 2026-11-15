@@ -229,6 +229,9 @@ def dump() -> str:
     lines.append(f"DeepSeek key  : {'✓ 已配置（画面文字识别可用）' if k else '✗ 未配置（跳过画面文字识别）'}")
     s = bili_sessdata()
     lines.append(f"B站 SESSDATA  : {'✓ 已配置（可取高清 + 读字幕列表）' if s else '✗ 未配置（B站最高 480P，且查不到字幕）'}")
+    hl = get("headless")
+    lines.append(f"后台模式      : "
+                 f"{'✓ headless（抓取不弹窗，bili_login 扫码时仍会弹）' if str(hl).lower() in ('1','true','yes','on') else '可见窗口（设 headless=true 可改为后台）'}")
     return "\n".join(lines)
 
 
