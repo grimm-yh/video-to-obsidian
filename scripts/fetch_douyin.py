@@ -137,7 +137,8 @@ def _port_pids(port: int) -> list[int]:
     绝不 taskkill /IM，避免误杀用户自己开着的浏览器窗口。"""
     try:
         r = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           encoding="utf-8", errors="replace")
     except Exception:
         return []
     pids: set[int] = set()
@@ -156,7 +157,8 @@ def _port_pids(port: int) -> list[int]:
 def _kill_pids(pids: list[int]) -> None:
     for pid in pids:
         subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
-                       capture_output=True, timeout=20)
+                       capture_output=True, timeout=20,
+                       encoding="utf-8", errors="replace")
     if pids:
         time.sleep(2)
 
