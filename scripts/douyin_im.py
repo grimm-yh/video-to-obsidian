@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -50,7 +51,8 @@ KEYWORDS = ("im/", "message", "msg", "conversation", "chat", "send_video",
 
 
 def ensure_browser(exe: str, port: int, profile: str, first_url: str,
-                   wait: int = 30, headless: bool = False) -> bool:
+                   wait: int = 30, headless: bool = False,
+                   extra_args: list[str] | None = None) -> bool:
     if _version(port):
         if _port_pages(port):
             log(f"复用已存在的实例 :{port}")
@@ -67,6 +69,8 @@ def ensure_browser(exe: str, port: int, profile: str, first_url: str,
             "--disable-popup-blocking", "--mute-audio"]
     if headless:
         args.append("--headless=new")
+    if extra_args:
+        args.extend(extra_args)
     args.append(first_url)
     log("启动实例（后台模式）" if headless else "启动实例（会弹窗口）")
     import subprocess
@@ -447,10 +451,237 @@ Array.from(document.querySelectorAll('a[href], [data-e2e], [class*="message"], [
     return 0 if (captures or ws_frames or dom_text) else 6
 
 
+def cmd_watch(args) -> int:
+    """常驻监听指定会话：发现新分享视频 → 提 aweme_id → 自动投喂 pipeline。"""
+    exe = config.get("browser_exe", None)
+    if not exe or not os.path.isfile(exe):
+        log("✗ 找不到浏览器")
+        return 2
+    os.makedirs(args.outdir, exist_ok=True)
+    seen_path = os.path.join(args.outdir, "seen-aweme.json")
+    queue_path = os.path.join(args.outdir, "queue.jsonl")
+    seen: dict = {}
+    if os.path.exists(seen_path):
+        seen = json.load(open(seen_path, encoding="utf-8"))
+    log(f"已处理台账 {len(seen)} 条（{seen_path}）")
+
+    # 窗口移到屏幕外：规避 headless 反爬，又不遮挡正常使用。
+    # 必须同时禁用遮挡节流，否则屏幕外窗口的渲染/输入会失效（实测面板打不开）
+    extra = None if args.show else [
+        "--window-position=-32000,-32000", "--window-size=1680,1200",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding", "--disable-background-timer-throttling"]
+    if not ensure_browser(exe, args.port, PROFILE, "https://www.douyin.com/",
+                          wait=40, headless=False, extra_args=extra):
+        return 3
+
+    pipeline_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "pipeline.py")
+
+    def poll_once(poll_no: int) -> list[str]:
+        """一轮：开面板 → 双击目标会话 → 收 aweme_id。返回新发现的 id。"""
+        page = pick_douyin_page(args.port)
+        if not page or "douyin.com" not in (page.get("url") or ""):
+            log("✗ 没找到抖音标签页（浏览器被关了？）")
+            return []
+        cdp = CDP(page["webSocketDebuggerUrl"], recv_timeout=60)
+        local: dict = {"cdp": cdp, "seen": set(), "caps": []}
+        try:
+            cdp.send("Network.enable")
+            cdp.send("Runtime.enable")
+            cdp.send("Page.enable")
+
+            def js(expr):
+                try:
+                    r = cdp.send("Runtime.evaluate",
+                                 {"expression": expr, "returnByValue": True})
+                except Exception as e:
+                    log(f"  js-error: {type(e).__name__}")
+                    return None
+                if r.get("exceptionDetails"):
+                    return None
+                return (r.get("result") or {}).get("value")
+
+            def click_xy(x, y, hover=1.0):
+                cdp.send("Input.dispatchMouseEvent",
+                         {"type": "mouseMoved", "x": x - 30, "y": y - 20})
+                time.sleep(0.3)
+                cdp.send("Input.dispatchMouseEvent",
+                         {"type": "mouseMoved", "x": x, "y": y})
+                time.sleep(hover)
+                cdp.send("Input.dispatchMouseEvent",
+                         {"type": "mousePressed", "x": x, "y": y,
+                          "button": "left", "clickCount": 1})
+                time.sleep(0.12)
+                cdp.send("Input.dispatchMouseEvent",
+                         {"type": "mouseReleased", "x": x, "y": y,
+                          "button": "left", "clickCount": 1})
+
+            def nap(sec):
+                n = max(1, int(sec / 0.5))
+                for _ in range(n):
+                    for ev in list(cdp.events):
+                        m = ev.get("method")
+                        if m != "Network.responseReceived":
+                            continue
+                        p = ev["params"]
+                        url = (p.get("response") or {}).get("url") or ""
+                        if "douyin.com" not in url.lower():
+                            continue
+                        if not ("multi/aweme/detail" in url
+                                or "imapi.douyin.com" in url):
+                            continue
+                        rid = p.get("requestId")
+                        if rid in local["seen"]:
+                            continue
+                        local["seen"].add(rid)
+                        try:
+                            b = cdp.send("Network.getResponseBody",
+                                         {"requestId": rid})
+                            body = b.get("body") or ""
+                            if b.get("base64Encoded"):
+                                import base64
+                                body = base64.b64decode(body).decode(
+                                    "utf-8", "replace")
+                        except Exception:
+                            continue
+                        if body:
+                            local["caps"].append({"url": url, "body": body[:2000000]})
+
+                time.sleep(0.5)
+
+            def open_panel() -> bool:
+                """先查再点：面板已开就不点（点会切换开关状态，盲目重试会震荡）。"""
+                rect = None
+                for _ in range(15):
+                    rect = js("""
+(function(){
+  const spans = Array.from(document.querySelectorAll('span,div,p'))
+    .filter(e => e.childElementCount === 0 && (e.textContent || '').trim() === '消息');
+  if (!spans.length) return null;
+  const el = (spans[0].closest('div') || spans[0]);
+  const r = el.getBoundingClientRect();
+  return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+})()
+""")
+                    if rect:
+                        break
+                    nap(1)
+                if not rect:
+                    return False
+                for _ in range(4):
+                    n = js("""
+(function(){
+  return Array.from(document.querySelectorAll('[data-e2e="conversation-item"]'))
+    .filter(e => e.getBoundingClientRect().width > 50).length;
+})()
+""") or 0
+                    if n:
+                        return True
+                    click_xy(rect["x"], rect["y"])
+                    nap(4)
+                return False
+
+            # 面板可能已开着（上一轮遗留）；先看有没有目标会话，没有再点开
+            target = None
+            for _ in range(3):
+                target = js("""
+(function(){
+  const kw = %s;
+  const items = Array.from(document.querySelectorAll('[data-e2e="conversation-item"]'))
+    .filter(e => e.getBoundingClientRect().width > 50
+                 && (e.innerText || '').indexOf(kw) === 0);
+  if (!items.length) return null;
+  const r = items[0].getBoundingClientRect();
+  return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+})()
+""" % json.dumps(args.conv))
+                if target:
+                    break
+                if not open_panel():
+                    log(f"  轮次 {poll_no}: IM 面板打不开，本轮跳过")
+                    return []
+                target = js("""
+(function(){
+  const kw = %s;
+  const items = Array.from(document.querySelectorAll('[data-e2e="conversation-item"]'))
+    .filter(e => e.getBoundingClientRect().width > 50
+                 && (e.innerText || '').indexOf(kw) === 0);
+  if (!items.length) return null;
+  const r = items[0].getBoundingClientRect();
+  return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+})()
+""" % json.dumps(args.conv))
+                if target:
+                    break
+                nap(3)
+
+            if not target:
+                log(f"  轮次 {poll_no}: 没找到会话「{args.conv}」")
+                return []
+
+            # 双击进聊天，触发历史接口
+            click_xy(target["x"], target["y"], hover=0.4)
+            time.sleep(0.3)
+            click_xy(target["x"], target["y"], hover=0.3)
+            nap(8)
+            # 会话开着的状态下再等几秒吃推送
+            nap(4)
+
+            ids: list[str] = []
+            for c in local["caps"]:
+                ids += re.findall(r'"aweme_id":"(\d{15,20})"', c["body"])
+            ids = list(dict.fromkeys(ids))
+            return ids
+        finally:
+            cdp.close()
+
+    try:
+        poll_no = 0
+        while True:
+            poll_no += 1
+            log(f"── 轮次 {poll_no} ──")
+            try:
+                ids = poll_once(poll_no)
+            except Exception as e:
+                log(f"  轮次异常（继续）：{type(e).__name__} {e}")
+                ids = []
+            new = [i for i in ids if i not in seen]
+            log(f"  会话「{args.conv}」共 {len(ids)} 条视频，新 {len(new)} 条")
+            if new:
+                with open(queue_path, "a", encoding="utf-8") as f:
+                    for i in new:
+                        f.write(json.dumps(
+                            {"url": f"https://www.douyin.com/video/{i}"},
+                            ensure_ascii=False) + "\n")
+                for i in new:
+                    seen[i] = time.strftime("%Y-%m-%d %H:%M:%S")
+                json.dump(seen, open(seen_path, "w", encoding="utf-8"),
+                          ensure_ascii=False, indent=1)
+                log(f"  ✓ 新增 {len(new)} 条已入队 {queue_path}")
+                if not args.no_process:
+                    for i in new:
+                        log(f"  处理 https://www.douyin.com/video/{i} …")
+                        subprocess.run(
+                            [sys.executable, "-u", pipeline_py,
+                             f"https://www.douyin.com/video/{i}"],
+                            cwd=os.getcwd())
+            if args.once:
+                break
+            # 分段睡眠，Ctrl+C 可即时打断
+            for _ in range(int(args.interval / 5)):
+                time.sleep(5)
+    finally:
+        if not args.keep:
+            shutdown(args.port)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, fn in (("login", cmd_login), ("scan", cmd_scan)):
+    for name, fn in (("login", cmd_login), ("scan", cmd_scan),
+                     ("watch", cmd_watch)):
         sp = sub.add_parser(name)
         sp.add_argument("--port", type=int, default=DEFAULT_PORT)
         if name == "scan":
@@ -463,6 +694,20 @@ def main() -> int:
             sp.add_argument("--outdir", default="douyin-im")
             sp.add_argument("--convs", type=int, default=3,
                             help="逐个点开前几个会话以触发历史接口")
+        if name == "watch":
+            sp.add_argument("--conv", default="祝你睡个好觉",
+                            help="只监听这个会话（按会话名前缀匹配）")
+            sp.add_argument("--interval", type=int, default=300,
+                            help="轮询间隔秒数（默认 300）")
+            sp.add_argument("--outdir", default="douyin-im")
+            sp.add_argument("--show", action="store_true",
+                            help="窗口正常显示（默认移到屏幕外）")
+            sp.add_argument("--no-process", action="store_true",
+                            help="只收集链接入队，不自动跑 pipeline")
+            sp.add_argument("--once", action="store_true",
+                            help="只轮询一轮就退出（调试用）")
+            sp.add_argument("--keep", action="store_true",
+                            help="退出时不关浏览器")
         sp.set_defaults(fn=fn)
     args = ap.parse_args()
     return args.fn(args)
