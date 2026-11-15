@@ -194,6 +194,10 @@ ASR_GATE = {
         "转写自 UP 主上传的字幕（人工）。",
         "准确度较高，但**仍需核对数字、专有名词与断句**，不要当作定论引用。",
     ],
+    "ytdlp-sub": [
+        "转写自平台侧字幕（经 yt-dlp 获取）。",
+        "自动字幕可能有同音字与断句错误，关键处回看原片核对，**未经复核前不要当作定论引用**。",
+    ],
 }
 
 
@@ -285,14 +289,147 @@ def step_draft(folder: str, source_url: str, overlay: list[dict] | None = None,
 
 # ---------------------------------------------------------------- 平台分派
 
-def detect_platform(url: str) -> str | None:
-    """只认抖音和 B 站，其余一律返回 None 让上层拒绝。"""
+def detect_platform(url: str) -> str:
+    """抖音、B 站走自家方案；其余全部交给 yt-dlp 兜底。"""
     u = url.lower()
     if "douyin.com" in u or "iesdouyin.com" in u:
         return "douyin"
     if "bilibili.com" in u or "b23.tv" in u:
         return "bilibili"
+    return "ytdlp"
+
+
+PLAYLIST_HINTS = re.compile(
+    r"(bilibili\.com/list/|space\.bilibili\.com/\d+/(?:video|favlist|channel|uploads)"
+    r"|favlist|collectiondetail|medialist|playlist\?|list=)", re.I)
+
+
+def _bili_cookie() -> str:
+    """B 站空间/合集接口必带 buvid3（否则 412），有 SESSDATA 更稳。"""
+    import bili_fetch
+    import urllib.request
+    sess = config.bili_sessdata()
+    parts = []
+    if sess:
+        parts.append(f"SESSDATA={sess}")
+    try:
+        req = urllib.request.Request(
+            "https://api.bilibili.com/x/frontend/finger/spi",
+            headers={"User-Agent": bili_fetch.UA, "Referer": "https://www.bilibili.com/"})
+        d = json.load(urllib.request.urlopen(req, timeout=10))
+        parts.append(f"buvid3={d['data']['b_3']}")
+    except Exception:
+        pass
+    return "; ".join(parts) or "buvid3=0"
+
+
+def _expand_bilibili(url: str) -> list[str] | None:
+    """B 站合集/收藏夹/UP 主投稿 → bvid 列表。识别不了返回 None。"""
+    import bili_fetch
+
+    def paged(fetch_page: callable, cap: int) -> list[str]:
+        """fetch_page(pn) 返回当页 bvid 列表；空页即停。WBI 签名必须逐页算，
+        占位符会把 pn=%7Bpn%7D 签进去导致服务端校验失败。"""
+        out, pn = [], 1
+        while pn <= 10:  # 每页最多 50-100 条，10 页已够 cap，再超由 cap 决定
+            items = fetch_page(pn)
+            if not items:
+                break
+            out.extend(items)
+            if len(out) >= cap:
+                break
+            pn += 1
+        return out
+
+    cookie = _bili_cookie()
+    mids = re.search(r"space\.bilibili\.com/(\d+)", url)
+    fav2 = re.search(r"space\.bilibili\.com/(\d+)/favlist[^?]*\?(?:[^&]*&)*fid=(\d+)", url)
+    season = re.search(r"bilibili\.com/list/(\d+)-(\d+)", url) \
+        or re.search(r"collectiondetail[^?]*\?(?:[^&]*&)*sid=(\d+)", url)
+
+    # UP 主投稿页（WBI 签名 + 登录态，实测匿名会被 412）
+    if mids and re.search(r"/(?:video|uploads/video|channel|uploads)", url):
+        mid = mids.group(1)
+
+        def arc(pn):
+            qs = bili_fetch._wbi_query(
+                {"mid": mid, "pn": pn, "ps": 50, "order": "pubdate"}, cookie)
+            d = bili_fetch._get(
+                f"https://api.bilibili.com/x/space/wbi/arc/search?{qs}", cookie)
+            if d.get("code") != 0:
+                raise RuntimeError(f"B 站接口错误 {d.get('code')}：{d.get('message')}")
+            return [v["bvid"] for v in ((d.get("data") or {}).get("list") or {})
+                    .get("vlist", [])]
+
+        items = paged(arc, 100)
+        return [f"https://www.bilibili.com/video/{b}" for b in items]
+
+    # 收藏夹（space.favlist?fid= 形态）
+    if fav2:
+        fid = fav2.group(2)
+
+        def fav(pn):
+            d = bili_fetch._get(
+                f"https://api.bilibili.com/x/v3/fav/resource/list?"
+                f"media_id={fid}&pn={pn}&ps=50&order=mtime&type=0&tid=0&platform=web",
+                cookie)
+            if d.get("code") != 0:
+                raise RuntimeError(f"B 站接口错误 {d.get('code')}：{d.get('message')}")
+            return [m["bvid"] for m in (d.get("data") or {}).get("medias") or []
+                    if m.get("bvid")]
+
+        items = paged(fav, 100)
+        return [f"https://www.bilibili.com/video/{b}" for b in items]
+
+    # 合集 / 系列（新版 list/<mid>-<sid> 与旧版 collectiondetail?sid=）
+    if season:
+        mid, sid = season.group(1), season.group(2)
+
+        def season_page(pn):
+            d = bili_fetch._get(
+                f"https://api.bilibili.com/x/polymer/space/seasons_archives_list?"
+                f"mid={mid}&season_id={sid}&page_num={pn}&page_size=100", cookie)
+            if d.get("code") != 0:
+                raise RuntimeError(f"B 站接口错误 {d.get('code')}：{d.get('message')}")
+            return [a["bvid"] for a in (d.get("data") or {}).get("archives") or []]
+
+        items = paged(season_page, 100)
+        return [f"https://www.bilibili.com/video/{b}" for b in items]
     return None
+
+
+def expand_collection(url: str) -> list[str] | None:
+    """合集/播放列表/UP 主投稿页 → 单视频链接列表。不像合集返回 None。"""
+    if not PLAYLIST_HINTS.search(url):
+        return None
+    try:
+        if detect_platform(url) == "bilibili":
+            subs = _expand_bilibili(url)
+            if subs is None:
+                subs = None  # 识别不了的 B 站形态按单链接处理
+        else:
+            import ytdlp_fetch
+            subs = ytdlp_fetch.expand(url)
+    except Exception as e:
+        log("S0", f"✗ 展开失败（按单链接处理）：{e}")
+        return None
+    if not subs:
+        log("S0", f"✗ 合集展开为空（按单链接处理）：{url}")
+        return None
+    log("S0", f"✓ {url} 是合集/播放列表，展开 {len(subs)} 条")
+    return subs
+
+
+def stage_ytdlp(url: str, workdir: str) -> tuple[str | None, str, dict]:
+    """yt-dlp 兜底的 S1+S2：元数据 + 下载 + 平台字幕。返回 (folder, stage, info)。"""
+    log("S1", f"处理 {url}")
+    try:
+        import ytdlp_fetch
+        folder = ytdlp_fetch.fetch(url, workdir, log=lambda m: log("S1", m))
+    except Exception as e:
+        log("S1", f"✗ {e}")
+        return None, "S1", {}
+    return folder, "S2", {"subtitle": None}
 
 
 def stage_douyin(url: str, workdir: str, fresh: bool) -> tuple[str | None, str, dict]:
@@ -338,18 +475,22 @@ def run_one(url: str, workdir: str, skip_asr: bool, fresh: bool,
     res = {"url": url, "status": "failed", "stage": "S1"}
 
     plat = detect_platform(url)
-    if not plat:
-        log("S1", "✗ 无法识别的链接。只支持抖音和 B 站，例如：")
-        log("S1", "    https://v.douyin.com/xxxxxxx/")
-        log("S1", "    https://www.bilibili.com/video/BV1xxxxxxxxx")
-        return res
     res["platform"] = plat
 
     info: dict = {}
     if plat == "douyin":
         folder, stage, info = stage_douyin(url, workdir, fresh)
-    else:
+    elif plat == "bilibili":
         folder, stage, info = stage_bilibili(url, workdir, page, fresh, use_subtitle)
+    else:
+        folder, stage, info = stage_ytdlp(url, workdir)
+
+    # 自家方案失败 → yt-dlp 兜底（抖音风控 / 链接失效重试 / B 站 durl 老稿件）
+    if not folder and plat in ("douyin", "bilibili"):
+        log("S1", f"{plat} 自家方案失败，回落 yt-dlp 兜底…")
+        folder, stage, info = stage_ytdlp(url, workdir)
+        if folder:
+            plat = "ytdlp"
     res["stage"] = stage
     if not folder:
         return res
@@ -364,6 +505,9 @@ def run_one(url: str, workdir: str, skip_asr: bool, fresh: bool,
         asr_source = "bili-ai" if sub.get("ai") else "bili-cc"
         log("S3", f"用 B 站字幕，跳过本地转写（{sub.get('lan_doc')}，"
                   f"{sub.get('cues')} 条 → {sub.get('segments')} 句）")
+    elif plat == "ytdlp" and os.path.exists(os.path.join(folder, "subtitle.txt")):
+        asr_source = "ytdlp-sub"
+        log("S3", "用 yt-dlp 拿到的平台字幕，跳过本地转写")
     elif not skip_asr:
         txt = step_asr(folder, prompt)
         if not txt:
@@ -405,7 +549,7 @@ def run_one(url: str, workdir: str, skip_asr: bool, fresh: bool,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("url", nargs="?", help="抖音链接（短链或网页版都可）")
+    ap.add_argument("url", nargs="?", help="视频链接（抖音 / B 站 / 其他站点由 yt-dlp 兜底；合集、播放列表、UP 主投稿页自动展开）")
     ap.add_argument("--queue", help="消费 clip_watch.py 产出的 queue.jsonl")
     ap.add_argument("--workdir", default=os.getcwd())
     ap.add_argument("--skip-asr", action="store_true")
@@ -446,9 +590,28 @@ def main() -> int:
     if args.url:
         urls.insert(0, args.url)
 
-    # 只有要处理抖音链接时才强制要求浏览器；纯 B 站任务不需要
+    # 合集/播放列表/UP 主投稿页 → 展开成单条（失败则按单链接处理）
+    expanded: list[str] = []
+    seen_u: set[str] = set()
+    for u in urls:
+        subs = expand_collection(u)
+        batch = subs or [u]
+        for b in batch:
+            if b not in seen_u:
+                seen_u.add(b)
+                expanded.append(b)
+    urls = expanded
+
+    # 抖音要浏览器；yt-dlp 路径要 yt-dlp 在 PATH 里
     need_browser = any(detect_platform(u) == "douyin" for u in urls)
     only_bili = bool(urls) and all(detect_platform(u) == "bilibili" for u in urls)
+    if any(detect_platform(u) == "ytdlp" for u in urls):
+        try:
+            import ytdlp_fetch
+            ytdlp_fetch._ytdlp_exe()
+        except Exception as e:
+            log("S0", f"✗ {e}")
+            return 2
     if not preflight(need_browser, model_required=not only_bili):
         log("S0", "前置检查未通过，已停止")
         return 3

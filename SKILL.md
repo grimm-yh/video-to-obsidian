@@ -215,6 +215,7 @@ python scripts/fetch_model.py                          # 拉 3.08GB large-v3 到
 ```
 
 系统依赖：`ffmpeg`、`ffprobe` 在 PATH 中；一个 Chromium 系浏览器（Chrome / Chromium / Edge）。
+其他站点兜底与合集展开还需 `yt-dlp`（`pip install yt-dlp`）。
 
 画面文字识别另需 **DeepSeek API key**（纯标准库实现，不必装 SDK）：
 
@@ -270,6 +271,15 @@ python scripts/pipeline.py "https://v.douyin.com/XXXX/"
 # B 站（不需要浏览器，也不会启动隔离实例）
 python scripts/pipeline.py "https://www.bilibili.com/video/BV1xxxxxxxxx"
 
+# 其他站点（YouTube / TikTok / Vimeo / X …）：yt-dlp 兜底，需要 yt-dlp 在 PATH
+python scripts/pipeline.py "https://www.youtube.com/watch?v=xxxx"
+
+# 合集 / 播放列表 / UP 主投稿页：自动展开成单条
+python scripts/pipeline.py "https://space.bilibili.com/<mid>/video"
+python scripts/pipeline.py "https://space.bilibili.com/<mid>/favlist?fid=<fid>"
+python scripts/pipeline.py "https://www.bilibili.com/list/<mid>-<sid>"
+python scripts/pipeline.py "https://www.youtube.com/playlist?list=<list_id>"
+
 # 带领域词，显著降低专业术语错字（强烈建议）
 python scripts/pipeline.py "<链接>" --prompt "AI编程、agent、上下文压缩、私域"
 
@@ -285,9 +295,21 @@ python scripts/pipeline.py "<B站链接>" --no-subtitle
 # 只要视频，不转写
 python scripts/pipeline.py "<链接>" --skip-asr
 
-# 批量：消费剪贴板队列（两个平台的链接可以混在同一个队列里）
+# 批量：消费剪贴板队列（任何平台的链接可以混在同一个队列里）
 python scripts/pipeline.py --queue queue.jsonl --ocr
 ```
+
+## 平台分派与兜底
+
+| 链接 | 引擎 | 说明 |
+| --- | --- | --- |
+| 抖音 | CDP 隔离实例（ego/Chrome） | 元数据最全（作者/时长/20 档码率） |
+| B 站 | 公开 API + WBI 签名字幕 | 不需要浏览器 |
+| 其余站点 | **yt-dlp**（`ytdlp_fetch.py`） | 1080p 封顶；拿得到平台字幕就免转写 |
+| 抖音/B 站失败时 | 自动回落 yt-dlp | 风控、瞬时断连、durl 老稿件的第二次机会 |
+
+合集展开也分两条腿：B 站合集/收藏夹/UP 投稿走自家 API（WBI + SESSDATA，
+匿名会被 412 风控拦），其余走 yt-dlp `--flat-playlist`。展开上限 100 条。
 
 只处理 B 站链接时，前置检查不会要求浏览器 —— 没装 Chromium 也能跑。
 
